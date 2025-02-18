@@ -88,7 +88,7 @@ class FeatureSplattingDataManager(FullImageDatamanager):
         cache_dir = self.config.dataparser.data
         cache_path = cache_dir / f"feature_splatting_{self.config.feature_type.lower()}_features.pt"
         if self.config.enable_cache and cache_path.exists():
-            cache_dict = torch.load(cache_path)
+            cache_dict = torch.load(cache_path, weights_only=False)
             if cache_dict.get("image_fnames") != image_fnames:
                 CONSOLE.print("Image filenames have changed, cache invalidated...")
             elif cache_dict.get("args") != extract_args.id_dict():

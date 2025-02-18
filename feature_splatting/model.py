@@ -17,6 +17,9 @@ from nerfstudio.viewer.server.viewer_elements import (
     ViewerSlider,
     ViewerVec3,
 )
+from nerfstudio.viewer.viewer_elements import ViewerControl, ViewerClick
+
+
 from nerfstudio.data.scene_box import OrientedBox
 
 # Feature splatting functions
@@ -84,13 +87,24 @@ class FeatureSplattingModel(SplatfactoModel):
         self.feature_mlp = two_layer_mlp(self.config.feat_latent_dim,
                                          self.config.mlp_hidden_dim,
                                          self.kwargs["metadata"]["feature_dim_dict"])
-        
+
         # Visualization utils
         self.maybe_populate_text_encoder()
         self.setup_gui()
 
         self.gaussian_editor = gaussian_editor()
     
+        with open("/home/azb/mapping.txt", 'r') as f:
+            dataset = eval(f.read())
+
+        for i in dataset:
+            dataset[i] = torch.tensor(eval(dataset[i]))
+
+        self.dataset = torch.stack(list(dataset.values()), dim=0).cuda()
+        print(self.dataset.shape)
+        self.keys = list(dataset.keys())
+
+
     def maybe_populate_text_encoder(self):
         if "clip_model_name" in self.kwargs["metadata"]:
             assert "clip" in self.main_feature_name.lower(), "CLIP model name should only be used with CLIP features"
@@ -103,6 +117,12 @@ class FeatureSplattingModel(SplatfactoModel):
         self.viewer_utils = ViewerUtils(self.text_encoding_func)
         # Note: the GUI elements are shown based on alphabetical variable names
         self.btn_refresh_pca = ViewerButton("Refresh PCA Projection", cb_hook=lambda _: self.viewer_utils.reset_pca_proj())
+        self.viewer_control = ViewerControl()
+        # def pointer_click_cb(click: ViewerClick):
+        #     print(f"Click at {click.origin} in direction {click.direction}, screen position {click.screen_pos}.")
+        #self.viewer_control.register_pointer_cb("click", pointer_click_cb)
+        self.enable_viewer = ViewerButton("See whats best", cb_hook=self._click_gaussian)
+
         if "clip" in self.main_feature_name.lower():
             self.hint_text = ViewerText(name="Note:", disabled=True, default_value="Use , to separate labels")
             self.lang_1_pos_text = ViewerText(
@@ -149,6 +169,33 @@ class FeatureSplattingModel(SplatfactoModel):
         # So I make a button that does nothing but to trigger rendering.
         pass
     
+    def _click_gaussian(self, button: ViewerButton):
+        """Start listening for click-based 3D point specification.
+        Refer to garfield_interaction.py for more details."""
+        def del_handle_on_rayclick(click: ViewerClick):
+            print(click, '!')
+
+            if hasattr(self, "outs"): 
+                click_coords = (click.screen_pos[0] * self.outs['clip'].shape[0], click.screen_pos[1] * self.outs['clip'].shape[1])
+
+                clip = self.outs['clip'][int(round(click_coords[0])), int(round(click_coords[1])), :]
+                goodness = self.outs['goodness'][int(round(click_coords[0])), int(round(click_coords[1])), 0]
+
+                sims = []
+
+                sims = F.cosine_similarity(clip, self.dataset, dim=1)
+                print("\n".join([str(self.keys[i]) for i in sims.argsort(descending=True).tolist()[:5]]))
+                print(goodness) 
+
+                with open('./clip.txt', 'w+') as f:
+                    f.write(str(clip.tolist()))
+           
+            self.enable_viewer.set_disabled(False)
+            self.viewer_control.unregister_click_cb(del_handle_on_rayclick)
+
+        self.enable_viewer.set_disabled(True)
+        self.viewer_control.register_click_cb(del_handle_on_rayclick)
+
     def estimate_ground(self):
         selected_obj_idx, sample_idx = self.segment_gaussian('ground', use_canonical=True, threshold=0.5)
         ground_means_xyz = self.means[sample_idx].detach().cpu().numpy()[selected_obj_idx]
@@ -366,17 +413,33 @@ class FeatureSplattingModel(SplatfactoModel):
 
     def decode_features(self, features_hwc: torch.Tensor, resize_factor: float = 1.) -> Dict[str, torch.Tensor]:
         # Decode features
+
         feature_chw = features_hwc.permute(2, 0, 1)
         feature_shape_hw = (int(self.main_feature_shape_chw[1] * resize_factor), int(self.main_feature_shape_chw[2] * resize_factor))
         rendered_feat = F.interpolate(feature_chw.unsqueeze(0), size=feature_shape_hw, mode="bilinear", align_corners=False)
         rendered_feat_dict = self.feature_mlp(rendered_feat)
-        # Rest of the features
+
         for key, feat_shape_chw in self.kwargs["metadata"]["feature_dim_dict"].items():
             if key != self.main_feature_name:
                 rendered_feat_dict[key] = F.interpolate(rendered_feat_dict[key], size=feat_shape_chw[1:], mode="bilinear", align_corners=False)
             rendered_feat_dict[key] = rendered_feat_dict[key].squeeze(0)
         return rendered_feat_dict
+
+    def decode_features_unscaled(self, features_hwc: torch.Tensor, resize_factor: float = 1.) -> Dict[str, torch.Tensor]:
+        feature_chw = features_hwc.permute(2, 0, 1).unsqueeze(0)
+        rendered_feat_dict = self.feature_mlp(feature_chw)
+
+        for key, feat_shape_chw in self.kwargs["metadata"]["feature_dim_dict"].items():
+            rendered_feat_dict[key] = rendered_feat_dict[key].squeeze(0)
+        return rendered_feat_dict
     
+
+    def total_variation_loss(self, img):
+        bs_img, c_img, h_img, w_img = img.size()
+        tv_h = torch.pow(img[:,:,1:,:]-img[:,:,:-1,:], 2).sum()
+        tv_w = torch.pow(img[:,:,:,1:]-img[:,:,:,:-1], 2).sum()
+        return (tv_h+tv_w)/(bs_img*c_img*h_img*w_img)
+
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         # Splatfacto computes the loss for the rgb image
         loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
@@ -388,7 +451,11 @@ class FeatureSplattingModel(SplatfactoModel):
             cur_loss_weight = 1.0 if key == self.main_feature_name else self.config.feat_aux_loss_weight
             ignore_feat_mask = (torch.sum(target_feat == 0, dim=0) == target_feat.shape[0])
             target_feat[:, ignore_feat_mask] = decoded_feature_dict[key][:, ignore_feat_mask]
-            feature_loss += cosine_loss(decoded_feature_dict[key], target_feat) * cur_loss_weight
+            if key != "score":
+                feature_loss += cosine_loss(decoded_feature_dict[key], target_feat) * cur_loss_weight
+            else:
+                feature_loss += F.mse_loss(decoded_feature_dict[key], target_feat, reduction='mean') * cur_loss_weight
+                feature_loss += self.total_variation_loss(decoded_feature_dict[key].unsqueeze(0)).squeeze() * (cur_loss_weight / 10)
         loss_dict["feature_loss"] = self.config.feat_loss_weight * feature_loss
         return loss_dict
     
@@ -416,7 +483,7 @@ class FeatureSplattingModel(SplatfactoModel):
             outs["feature"], self.viewer_utils.pca_proj
         )
         # TODO(roger): this resize factor affects the resolution of similarity map. Maybe we should use a fixed size?
-        decoded_feature_dict = self.decode_features(outs["feature"], resize_factor=8)
+        decoded_feature_dict = self.decode_features_unscaled(outs["feature"], resize_factor=8)
         if "clip" in self.main_feature_name.lower() and self.viewer_utils.is_embed_valid('positive'):
             clip_features = decoded_feature_dict[self.main_feature_name]
             clip_features /= clip_features.norm(dim=0, keepdim=True)
@@ -442,6 +509,17 @@ class FeatureSplattingModel(SplatfactoModel):
                 out_sim = out_sim[None, None, ...]  # 1, 1, H, W
                 outs["similarity"] = F.interpolate(out_sim, size=outs["rgb"].shape[:2], mode="bilinear", align_corners=False).squeeze()
                 outs["similarity"] = outs["similarity"][:, :, None]
+
+        goodness = decoded_feature_dict['score'].permute(1, 2, 0)[:, :, 0]
+        goodness = goodness[None, None, ...]  # 1, 1, H, W
+
+        outs['clip'] = F.interpolate(decoded_feature_dict['samclip'][None, ...], size=outs["rgb"].shape[:2], mode="bilinear", align_corners=False).squeeze().permute(1, 2, 0)
+
+        outs["goodness"] = F.interpolate(goodness, size=outs["rgb"].shape[:2], mode="bilinear", align_corners=False).squeeze()
+        outs["goodness"] = outs["goodness"][:, :, None]
+
+        self.outs = outs
+
         return outs
     
     # ===== Utils functions for managing the gaussians =====
